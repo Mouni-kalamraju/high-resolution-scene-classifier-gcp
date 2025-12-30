@@ -1,0 +1,42 @@
+name: Stop All Vertex AI Billing
+
+on:
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          project_id: '${{ secrets.GCP_PROJECT_ID }}'
+
+      - name: 'Undeploy Models and Delete Endpoints'
+        run: |
+          echo "🔍 Finding all endpoints in us-central1..."
+          ENDPOINTS=$(gcloud ai endpoints list --region=us-central1 --format="value(name)")
+
+          for EP in $ENDPOINTS; do
+            echo "Processing Endpoint: $EP"
+            
+            # 1. Find and Undeploy all models (This stops the $0.15/hr charge)
+            DEPLOYED_MODELS=$(gcloud ai endpoints describe $EP --region=us-central1 --format="value(deployedModels.id)")
+            for DM_ID in $DEPLOYED_MODELS; do
+              echo "  Stopping model: $DM_ID"
+              gcloud ai endpoints undeploy-model $EP --region=us-central1 --deployed-model-id=$DM_ID
+            done
+
+            # 2. Delete the Endpoint resource itself (Cleans up the UI)
+            echo "  Deleting empty endpoint: $EP"
+            gcloud ai endpoints delete $EP --region=us-central1 --quiet
+          done

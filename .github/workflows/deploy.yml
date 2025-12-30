@@ -1,0 +1,113 @@
+name: Intel Image Classifier CI/CD
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          project_id: '${{ secrets.GCP_PROJECT_ID }}'
+
+      - name: Configure Docker for GCP
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Cleaned: Uses Secret for Project ID and standard repo names
+          tags: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/intel-repo/classifier:latest
+
+  deploy:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          project_id: '${{ secrets.GCP_PROJECT_ID }}'
+
+      - name: 'Upload to Vertex AI Model Registry'
+        run: |
+          gcloud ai models upload \
+            --region=us-central1 \
+            --display-name=intel-classifier-production \
+            --container-image-uri=us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/intel-repo/classifier:latest \
+            --container-health-route=/health \
+            --container-predict-route=/predict \
+            --container-ports=8080
+
+      - name: 'Deploy Model to Endpoint'
+        run: |
+          # 1. Get Model ID dynamically
+          MODEL_ID=$(gcloud ai models list --region=us-central1 --filter="display_name=intel-classifier-production" --format="value(name)" --limit=1)
+          
+          # 2. Find or Create Endpoint dynamically
+          ENDPOINT_ID=$(gcloud ai endpoints list --region=us-central1 --filter="display_name=intel-scene-endpoint" --format="value(name)" --limit=1)
+
+          if [ -z "$ENDPOINT_ID" ]; then
+            echo "📢 Creating new endpoint..."
+            ENDPOINT_ID=$(gcloud ai endpoints create --region=us-central1 --display-name=intel-scene-endpoint --format="value(name)")
+          else
+            echo "✅ Using existing Endpoint: $ENDPOINT_ID"
+          fi
+
+          # 3. Cleanup: Undeploy old models to prevent double-billing
+          echo "🧹 Cleaning up old deployments..."
+          DEPLOYED_MODEL_IDS=$(gcloud ai endpoints describe $ENDPOINT_ID --region=us-central1 --format="value(deployedModels.id)")
+          
+          for DEPLOYED_ID in $DEPLOYED_MODEL_IDS; do
+            if [ ! -z "$DEPLOYED_ID" ]; then
+              gcloud ai endpoints undeploy-model $ENDPOINT_ID --region=us-central1 --deployed-model-id=$DEPLOYED_ID
+            fi
+          done
+
+          # 4. Final Deployment
+          gcloud ai endpoints deploy-model $ENDPOINT_ID \
+            --region=us-central1 \
+            --model=$MODEL_ID \
+            --display-name=ensemble-v5-production \
+            --machine-type=n1-standard-2 \
+            --traffic-split=0=100
+
+      - name: 'Verify Deployment (Smoke Test)'
+        run: |
+          pip install google-cloud-aiplatform
+          # We manually set the env vars from secrets for the python script
+          export GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
+          export GCP_ENDPOINT_ID=$(gcloud ai endpoints list --region=us-central1 --filter="display_name=intel-scene-endpoint" --format="value(name)" --limit=1)
+          python test_ci_cd.py
